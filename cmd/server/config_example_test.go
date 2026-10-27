@@ -41,4 +41,10 @@ func TestConfigExampleIsValid(t *testing.T) {
 	if c.Models.Allowed == nil {
 		t.Error("models.allowed 示例应存在（空数组即可），否则用户不知道有白名单开关")
 	}
+	// r2 数据外置：示例必须带该段（base_url 空 = 不启用），否则用户不知道能把
+	// 数据放到 Cloudflare R2（面向不能挂载外部卷的部署）。
+	if c.R2.Prefix != "wb2a/" || !c.R2.SyncDeletes || c.R2.SyncIntervalSeconds != 60 {
+		t.Errorf("r2 示例缺省值应为 prefix=wb2a/ sync_deletes=true interval=60，得到 %q/%v/%d",
+			c.R2.Prefix, c.R2.SyncDeletes, c.R2.SyncIntervalSeconds)
+	}
 }

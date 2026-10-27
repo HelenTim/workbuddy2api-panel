@@ -27,8 +27,13 @@ COPY --from=build /out/credit /app/credit
 COPY login.sh signin.sh credit.sh /app/
 COPY scripts/probe_active.py /app/scripts/probe_active.py
 RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh
-# 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
-COPY config.example.json /app/config.json
+# 镜像不带真实配置：example 只作为模板备着，不拷成 config.json。
+# 为什么不能内置 config.json：容器平台（Render 等）每次部署/唤醒都是全新磁盘，
+# 内置文件的 mtime 是镜像构建时刻，会永远比 R2 远端副本“新”，把 R2 配置恢复
+# 挡在外面；不内置时首次启动走 WriteDefault 自动生成，R2 上有配置则在引导
+# 阶段（本地不存在 → 无条件拉回）正确恢复。裸跑容器不挂载时同样受益：
+# 自动生成随机 api_key，而不是带着人尽皆知的 test_key。
+COPY config.example.json /app/config.example.json
 USER app
 EXPOSE 7863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \

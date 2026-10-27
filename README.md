@@ -474,6 +474,11 @@ curl -s http://localhost:7863/v1/messages \
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
+| `r2.base_url` | 空 | **数据外置到 Cloudflare R2**（经自建 Worker 文件接口）。非空即启用：启动先把 `config.json`、`auths/`、数据目录从 R2 拉回本地，运行期按间隔把变更推回；面向「不能挂载外部持久卷、重启即空盘」的部署。改动需重启 |
+| `r2.auth_key` | 空 | Worker 的 `X-Custom-Auth-Key`（对应 Worker 环境变量 `AUTH_KEY_SECRET`）；`base_url` 非空时必填 |
+| `r2.prefix` | `wb2a/` | 桶内 key 前缀。该前缀目录归本程序独占，勿手动往里放文件（删除同步是前缀范围的） |
+| `r2.sync_interval_seconds` | `60` | 后台同步间隔（秒）；`<=0` 回落 60 |
+| `r2.sync_deletes` | `true` | 本地文件被删（请求归档按保留策略轮换）时同步删除远端副本。关闭后远端只增不减，小磁盘慎用 |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.max_in_flight_global` | `2` | global 域单账号在途上限（国际版 WAF 风控更紧，压低并发） |
 | `pool.degrade_threshold` | `5` | 连败降权阈值：未知错误（ErrClient/传输层）连败 N 次临时出池 |
@@ -510,7 +515,61 @@ curl -s http://localhost:7863/v1/messages \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_R2_BASE_URL` · `WB2A_R2_AUTH_KEY` · `WB2A_R2_PREFIX`
+
+### 数据外置到 Cloudflare R2（无持久卷部署）
+
+适用场景：运行环境**不能挂载外部持久卷**（重新部署/重启后磁盘是空的），但希望账号凭证、池状态、用量/余额/积分历史、请求归档在重启后仍在。做法是自建一个 Cloudflare Worker 把 R2 桶暴露成文件接口，本项目把数据目录文件级镜像上去。未配置时行为完全不变。
+
+**同步范围**（远端 key 为 `<prefix><tag>/<相对路径>`）：
+
+- `config`：`config.json`（磁盘为空时连配置本身也能恢复）
+- `auth`：`auth_dir` 下全部账号凭证
+- `state`：`state_file` 所在目录下的所有文件——`state.json`、`usage.json`、`balance_history.json`、`credit-history.json`、`task-*.json`、`model.json`、`output_probes.json` 以及 `request-logs/*.jsonl` 子目录
+
+启动时对每个远端文件：本地缺失或**比远端旧**才拉回（本地较新则保留并由后台推上去）；运行期每 `r2.sync_interval_seconds` 秒把大小/mtime 变化的文件 PUT 上去，本地被保留策略删掉的归档分片同步 DELETE。
+
+**Worker 一侧**：R2 桶绑定到 `FILE_BUCKET`，Worker 密钥写进 `AUTH_KEY_SECRET`（即项目里的 `r2.auth_key`）。Worker 脚本即用户提供的文件管理器（`GET /` 列表、`GET/PUT/DELETE /<key>`）。
+
+> **安全提醒（务必处理）**：原版脚本的 `authorizeRequest` 对 `GET` 恒放行——**任何人知道 Worker 地址就能下载桶里的全部文件**，包括 `auths/` 里的账号 refresh token。启用前请把 GET 也纳入鉴权：
+>
+> ```js
+> function authorizeRequest(request, env, key) {
+>     return hasValidHeader(request, env); // 所有方法都要求 X-Custom-Auth-Key
+> }
+> ```
+>
+> 本项目客户端对所有请求（含 GET）都携带该头，与加固后的 Worker 完全兼容。
+
+**配置方式一（配置文件）**：
+
+```json
+"r2": {
+  "base_url": "https://<你的-worker>.workers.dev",
+  "auth_key": "<AUTH_KEY_SECRET>",
+  "prefix": "wb2a/",
+  "sync_interval_seconds": 60,
+  "sync_deletes": true
+}
+```
+
+**配置方式二（环境变量引导，推荐给空盘部署）**：磁盘为空时连 `config.json` 都不存在，先用环境变量让程序把配置从 R2 拉回来，再按配置恢复其余数据：
+
+```bash
+WB2A_R2_BASE_URL=https://<你的-worker>.workers.dev
+WB2A_R2_AUTH_KEY=<AUTH_KEY_SECRET>
+WB2A_R2_PREFIX=wb2a/
+```
+
+三个变量在运行时同样生效（等价于写进配置文件），因此空盘部署可以只靠环境变量完成全部参数注入；首次启动前可先用同一套 Worker 把一份 `config.json` 传到 `wb2a/config/config.json`（文件管理器界面上传即可）。
+
+**注意事项**：
+
+- **同一份数据只允许一个实例写入**。两个实例同时跑会互相覆盖状态文件；多副本请各用独立的 `r2.prefix`。
+- 换 `auth_dir` / `state_file` 路径会让旧路径下的远端文件被视为「本地已删除」而被清理（`r2.sync_deletes=true` 时）。迁移路径前先备份或临时关闭删除同步。
+- 本地/远端谁更新的判断用文件 mtime 与 R2 对象 `uploaded` 时间戳，跨机器时钟偏差过大时可能判反；请保证系统时间准确（NTP）。
+- R2 侧没有请求归档的保留策略，删除依赖本程序的轮换；`r2.sync_deletes=false` 时远端会持续增长。
+- `upstream.dump_dir` 等诊断目录不在同步范围（正文含用户提示词，不建议外置）。
 
 ## 核心行为语义
 

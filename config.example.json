@@ -90,6 +90,14 @@
     "url": "",
     "token": ""
   },
+  "r2": {
+    "_comment": "数据外置（Cloudflare Worker + R2）。base_url 填 Worker 地址即启用：启动时从 R2 拉回 config/auths/data，运行期把变更推回，适合不能挂载外部持久卷的部署。auth_key 对应 Worker 的 AUTH_KEY_SECRET；prefix 为桶内目录前缀（缺省 wb2a/，归本程序独占，勿手动放文件）。磁盘为空时可用环境变量 WB2A_R2_BASE_URL / WB2A_R2_AUTH_KEY / WB2A_R2_PREFIX 引导恢复 config.json 本身。",
+    "base_url": "",
+    "auth_key": "",
+    "prefix": "wb2a/",
+    "sync_interval_seconds": 60,
+    "sync_deletes": true
+  },
   "pool": {
     "max_in_flight": 3,
     "max_in_flight_global": 2,

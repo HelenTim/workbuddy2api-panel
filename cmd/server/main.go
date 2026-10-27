@@ -28,6 +28,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/panel"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/r2sync"
 	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
@@ -99,6 +100,18 @@ func main() {
 	// 会报一份根本没读的文件。下面退回「默认+env」时清空，同理（issue #155）。
 	loadedFrom := *cfgPath
 
+	// 磁盘为空（数据不能挂载外部卷）时 config.json 本身也可能不存在：先用环境变量
+	// 里的 R2 引导凭据把它拉回来，再走正常加载。仅在本地缺失或比远端旧时覆盖，
+	// 持久磁盘部署行为不变；失败只告警，继续按本地/默认启动。
+	if boot := r2FromEnv(); boot != nil {
+		bootSyncer := r2sync.New(boot, r2sync.Options{ConfigFile: *cfgPath})
+		bootCtx, bootCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if err := bootSyncer.Restore(bootCtx); err != nil {
+			log.Printf("WARN: [r2] 引导恢复 config.json 失败: %v", err)
+		}
+		bootCancel()
+	}
+
 	cfg, err := Load(*cfgPath)
 	if err != nil {
 		// errors.Is 才能看穿 Load 里 fmt.Errorf("%w") 的包装；os.IsNotExist 不行。
@@ -121,12 +134,34 @@ func main() {
 		}
 	}
 
+	// R2 数据外置：按配置（含 applyEnv 填充的 r2 段）恢复 auths / 数据目录，之后
+	// 各组件照常读本地文件；运行期由后台循环把变更推回。defer 注册在这里、早于
+	// pool/requestLog 的 defer——LIFO 下 Close 最后执行，最后一次同步才能看到
+	// 各组件停机时最终落盘的文件。
+	var r2s *r2sync.Syncer
+	if cfg.R2.BaseURL != "" {
+		r2s = r2sync.New(r2sync.NewClient(cfg.R2.BaseURL, cfg.R2.AuthKey, cfg.R2.Prefix), r2sync.Options{
+			ConfigFile:   *cfgPath,
+			AuthDir:      cfg.AuthDir,
+			StateDir:     filepath.Dir(cfg.StateFile),
+			Interval:     time.Duration(cfg.R2.SyncIntervalSeconds) * time.Second,
+			DeleteRemote: cfg.R2.SyncDeletes,
+		})
+		defer r2s.Close()
+		restoreCtx, restoreCancel := context.WithTimeout(context.Background(), time.Minute)
+		if err := r2s.Restore(restoreCtx); err != nil {
+			log.Printf("WARN: [r2] 启动恢复未完全成功（缺失部分按本地现状继续）: %v", err)
+		}
+		restoreCancel()
+		log.Printf("[r2] 数据外置已启用: worker=%s prefix=%q 每 %ds 同步一次（恢复 %s / %s）",
+			cfg.R2.BaseURL, cfg.R2.Prefix, cfg.R2.SyncIntervalSeconds, cfg.AuthDir, filepath.Dir(cfg.StateFile))
+	}
+
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
 	}
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
-
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
 
@@ -510,6 +545,10 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// R2 后台同步：停机时 ctx 取消、goroutine 退出，r2s.Close（defer）负责最后刷盘。
+	if r2s != nil {
+		r2s.Start(ctx)
+	}
 	updateManager.SetRestart(stop)
 	go updateManager.Run(ctx)
 	// 账号后台任务（taskjobs）：状态与主 state 同目录，重启后自动恢复未完成作业。
@@ -599,6 +638,17 @@ func main() {
 		<-shutdownDone
 	}
 	log.Printf("bye")
+}
+
+// r2FromEnv 用 WB2A_R2_BASE_URL（+ AUTH_KEY / PREFIX）构建引导客户端；未配置返回 nil。
+// 引导恢复只负责 config.json：配置本身可能只存在远端，必须先于 Load 执行。运行期的
+// 完整恢复与镜像由 Load 之后的配置驱动（环境变量在 applyEnv 中同样生效）。
+func r2FromEnv() *r2sync.Client {
+	baseURL := os.Getenv("WB2A_R2_BASE_URL")
+	if baseURL == "" {
+		return nil
+	}
+	return r2sync.NewClient(baseURL, os.Getenv("WB2A_R2_AUTH_KEY"), os.Getenv("WB2A_R2_PREFIX"))
 }
 
 // warmModelRates 启动预热各域模型积分倍率表（供积分保底的目录兜底判定）。
@@ -890,6 +940,7 @@ func restartRequiredFields(current, next *Config) []string {
 	changed("prompt.text", current.PromptText, next.PromptText)
 	changed("upstash.url", current.Upstash.URL, next.Upstash.URL)
 	changed("upstash.token", current.Upstash.Token, next.Upstash.Token)
+	changed("r2", current.R2, next.R2)
 	changed("session_sticky.enabled", current.SessionSticky.Enabled, next.SessionSticky.Enabled)
 	changed("session_sticky.ttl", current.SessionTTL, next.SessionTTL)
 	changed("session_sticky.gc_interval", current.SessionGCInterval, next.SessionGCInterval)

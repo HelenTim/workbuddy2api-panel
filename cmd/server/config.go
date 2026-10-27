@@ -278,6 +278,26 @@ type Config struct {
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
 	} `json:"upstash"`
 
+	// R2 数据外置：通过自建的 Cloudflare Worker（R2 文件接口）镜像项目数据。
+	// 面向「不能挂载外部持久卷」的部署形态——本地磁盘只当缓存，启动时先把
+	// config/auths/data 拉回本地、运行期后台把变更推回，重启后数据仍在。
+	// 与 upstash 相互独立：upstash 是池状态快照，R2 是数据目录的文件级镜像。
+	R2 struct {
+		// BaseURL Worker 地址（https://xxx.workers.dev）；空 = 不启用。
+		BaseURL string `json:"base_url"`
+		// AuthKey 写入/删除用的 X-Custom-Auth-Key（对应 Worker 的 AUTH_KEY_SECRET）。
+		// base_url 非空时必填——Worker 的 PUT/DELETE 都靠它鉴权。
+		AuthKey string `json:"auth_key"`
+		// Prefix 远端 key 前缀（缺省 "wb2a/"）。只管理该前缀下的对象；前缀目录
+		// 归本程序独占，桶里手动上传的其它文件不会被读取或删除。
+		Prefix string `json:"prefix"`
+		// SyncIntervalSeconds 后台同步间隔（秒），缺省 60；<=0 回落默认。
+		SyncIntervalSeconds int `json:"sync_interval_seconds"`
+		// SyncDeletes 本地文件被删（请求归档按保留策略轮换）时同步删除远端副本，
+		// 缺省 true。关闭后远端只增不减（重启会全量拉回，小磁盘慎用）。
+		SyncDeletes bool `json:"sync_deletes"`
+	} `json:"r2"`
+
 	Pool struct {
 		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
 		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
@@ -473,6 +493,11 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// R2 数据外置缺省不启用（base_url 空）。前缀 "wb2a/" 避免与桶里手动管理的
+	// 文件混在一起（Worker 的删除是整桶范围，前缀是唯一的分区手段）。
+	c.R2.Prefix = "wb2a/"
+	c.R2.SyncIntervalSeconds = 60
+	c.R2.SyncDeletes = true
 	c.Admin.AuditFile = "./data/admin_audit.log"
 	c.Alerting.IntervalSeconds = 30
 	c.Alerting.TimeoutSeconds = 5
@@ -709,6 +734,24 @@ func applyEnv(c *Config) {
 			c.Pool.PreferExpiring = b
 		}
 	}
+	// R2 数据外置：BASE_URL/AUTH_KEY 也是「磁盘为空时先恢复 config.json」的引导
+	// 凭据（见 main.r2FromEnv），PREFIX 需与配置文件里的值一致。
+	if v := os.Getenv("WB2A_R2_BASE_URL"); v != "" {
+		c.R2.BaseURL = v
+	}
+	if v := os.Getenv("WB2A_R2_AUTH_KEY"); v != "" {
+		c.R2.AuthKey = v
+	}
+	if v := os.Getenv("WB2A_R2_PREFIX"); v != "" {
+		c.R2.Prefix = v
+	}
+	// 同步间隔也给环境变量：容器平台（config.json 本身在 R2 上、改起来要绕一圈）
+	// 直接在平台控制台调最顺手； Workers 免费版有日请求配额，想放宽间隔无需动 R2。
+	if v := os.Getenv("WB2A_R2_SYNC_INTERVAL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.R2.SyncIntervalSeconds = n
+		}
+	}
 }
 
 // EnvironmentManagedFields 列出被启动环境变量覆盖的配置字段路径（**值不回传**——
@@ -739,6 +782,8 @@ func (c *Config) EnvironmentManagedFields() []string {
 		{"WB2A_METRICS_ENABLED", "metrics.enabled", "bool"},
 		{"WB2A_BUDGET_DAILY_CREDIT_LIMIT", "budget.daily_credit_limit", "float"},
 		{"WB2A_ALERTING_ENABLED", "alerting.enabled", "bool"}, {"WB2A_ALERTING_WEBHOOK_URL", "alerting.webhook_url", ""},
+		{"WB2A_R2_BASE_URL", "r2.base_url", ""}, {"WB2A_R2_AUTH_KEY", "r2.auth_key", ""},
+		{"WB2A_R2_PREFIX", "r2.prefix", ""}, {"WB2A_R2_SYNC_INTERVAL_SECONDS", "r2.sync_interval_seconds", "int"},
 	}
 	var out []string
 	for _, field := range fields {
@@ -1041,6 +1086,26 @@ func (c *Config) normalize() error {
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
+	}
+	// R2 数据外置：base_url 非空时校验地址与鉴权键；前缀归一化为「非空则补尾斜杠」
+	//（与 r2sync.NormalizePrefix 同口径；此处不复用包，避免 config 依赖同步层）。
+	c.R2.BaseURL = strings.TrimSpace(c.R2.BaseURL)
+	if c.R2.BaseURL != "" {
+		if strings.TrimSpace(c.R2.AuthKey) == "" {
+			return fmt.Errorf("r2.base_url 已配置但 r2.auth_key 为空（Worker 的写入/删除依赖 X-Custom-Auth-Key）")
+		}
+		u, err := url.Parse(c.R2.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("r2.base_url: 需要 http(s) 地址（Worker 的 workers.dev 地址）")
+		}
+		c.R2.BaseURL = strings.TrimRight(c.R2.BaseURL, "/")
+	}
+	c.R2.Prefix = strings.Trim(strings.TrimSpace(c.R2.Prefix), "/")
+	if c.R2.Prefix != "" {
+		c.R2.Prefix += "/"
+	}
+	if c.R2.SyncIntervalSeconds <= 0 {
+		c.R2.SyncIntervalSeconds = 60
 	}
 	return c.normalizePrompt()
 }
