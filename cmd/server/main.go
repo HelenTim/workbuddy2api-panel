@@ -484,6 +484,16 @@ func main() {
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
+		// R2 手动同步（配置页「立即同步」按钮）：未启用外置时为 nil，按钮隐藏。
+		R2SyncNow: func() error {
+			if r2s == nil {
+				return errors.New("未启用")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			return r2s.SyncNow(ctx)
+		},
+		R2Enabled: func() bool { return r2s != nil },
 	})
 	// 任务频道日志落盘（重启后任务结果可回溯）；失败只 WARN，不阻塞启动。
 	if err := pn.Logs().SetTaskArchive(stateSibling(cfg.StateFile, "task-logs.json")); err != nil {

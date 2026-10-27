@@ -29,6 +29,7 @@ func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 		"config":                     cfg,
 		"api_key_env_managed":        os.Getenv("WB2A_API_KEY") != "",
 		"environment_managed_fields": configManagedFields(cfg),
+		"r2_enabled":                 p.cfg.R2Enabled != nil && p.cfg.R2Enabled(),
 	})
 }
 
@@ -65,6 +66,21 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 		"api_key_env_managed":        os.Getenv("WB2A_API_KEY") != "",
 		"environment_managed_fields": managedFields,
 	})
+}
+
+// r2SyncNow 手动触发一轮「本地 → R2」同步（数据外置）。后台周期同步之外，
+// 改完配置/加完账号想立刻把数据推上 R2（不等下一个间隔）时点它；同步结果
+// 由 syncer 打进面板日志，这里只回报成败。
+func (p *Panel) r2SyncNow(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.R2SyncNow == nil {
+		writeErr(w, http.StatusNotImplemented, "r2 同步未启用")
+		return
+	}
+	if err := p.cfg.R2SyncNow(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "r2 同步失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // configManagedFields 读取配置对象的「被启动环境变量托管字段」清单（可选能力：

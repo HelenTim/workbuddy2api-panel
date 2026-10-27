@@ -1652,6 +1652,24 @@ $('btnEye').onclick = () => {
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
 $('btnCfgReload').onclick = loadConfig;
+/* R2 数据外置的「立即同步」按钮：GET /panel/api/config 顺带探测能力（501 = 未
+   启用，按钮保持隐藏）。点击后立即把变更推上 R2，不等下一个后台间隔；成败走
+   toast，明细看「运行日志」（syncer 每轮打一条上传/删除统计）。 */
+(async () => {
+  try {
+    const d = await api('config');
+    if (d && d.r2_enabled) $('btnR2Sync').hidden = false;
+  } catch { /* 配置接口不可用时按钮本就隐藏 */ }
+})();
+$('btnR2Sync').onclick = async () => {
+  const btn = $('btnR2Sync');
+  btn.disabled = true; btn.textContent = '同步中…';
+  try {
+    await api('r2_sync', { method: 'POST' });
+    toast('已同步到 R2（明细见运行日志）', 'ok');
+  } catch (e) { toast('R2 同步失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '立即同步到 R2'; }
+};
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。

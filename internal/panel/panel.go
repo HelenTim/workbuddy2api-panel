@@ -89,6 +89,14 @@ type Config struct {
 	// 面板据它在限流提示里标注「已路由至 X」—— 否则用户看到「v4.1 限流」
 	// 会以为服务断了，实际请求已被自动改道到等价模型继续服务。
 	ModelFallback func() map[string]string
+
+	// R2SyncNow 立即执行一轮「本地 → R2」同步（数据外置，见 internal/r2sync）。
+	// nil = 未启用 R2 外置，配置页的「立即同步」按钮隐藏。不返回统计：
+	// 结果由 syncer 打进面板日志，按钮只关心成败。
+	R2SyncNow func() error
+	// R2Enabled 供配置页探测 R2 外置是否启用（决定「立即同步」按钮显隐）；
+	// nil = 恒视为未启用。
+	R2Enabled func() bool
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -277,6 +285,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("POST /panel/api/r2_sync", p.withAuth(p.r2SyncNow))
 	p.mux.HandleFunc("GET /panel/api/update", p.withAuth(p.updateStatus))
 	p.mux.HandleFunc("POST /panel/api/update/check", p.withAuth(p.checkUpdate))
 	p.mux.HandleFunc("POST /panel/api/update/install", p.withAuth(p.installUpdate))

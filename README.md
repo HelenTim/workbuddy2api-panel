@@ -517,21 +517,25 @@ curl -s http://localhost:7863/v1/messages \
 
 `WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE` · `WB2A_R2_BASE_URL` · `WB2A_R2_AUTH_KEY` · `WB2A_R2_PREFIX`
 
-### 数据外置到 Cloudflare R2（无持久卷部署）
+### 数据外置到 Cloudflare R2（挂外部存储）
 
-适用场景：运行环境**不能挂载外部持久卷**（重新部署/重启后磁盘是空的），但希望账号凭证、池状态、用量/余额/积分历史、请求归档在重启后仍在。做法是自建一个 Cloudflare Worker 把 R2 桶暴露成文件接口，本项目把数据目录文件级镜像上去。未配置时行为完全不变。
+**适用场景**：部署平台不能挂载持久卷（Render 免费版每次重启/休眠唤醒磁盘即空、容器平台重新部署即丢数据），但需要账号凭证、池状态、用量/余额/积分历史、请求归档在重启后仍在。做法：自建一个 Cloudflare Worker 把 R2 桶暴露成文件接口（见你手上的文件管理器 Worker），本项目把**数据目录整体做文件级镜像**——启动时从 R2 拉回本地，运行期后台把变更推回。未配置时行为完全不变，本地部署零影响。
 
-**同步范围**（远端 key 为 `<prefix><tag>/<相对路径>`）：
+**同步范围**（远端 key = `<prefix><tag>/<相对路径>`）：
 
-- `config`：`config.json`（磁盘为空时连配置本身也能恢复）
-- `auth`：`auth_dir` 下全部账号凭证
-- `state`：`state_file` 所在目录下的所有文件——`state.json`、`usage.json`、`balance_history.json`、`credit-history.json`、`task-*.json`、`model.json`、`output_probes.json` 以及 `request-logs/*.jsonl` 子目录
+| 远端目录 | 本地内容 |
+|---|---|
+| `<prefix>config/` | `config.json`（磁盘为空时连配置本身也能恢复） |
+| `<prefix>auth/` | `auth_dir` 下全部账号凭证（OAuth 落盘的 `workbuddy-*.json`、API Key 账号） |
+| `<prefix>state/` | `state_file` 所在目录：`state.json`、`usage.json`、`balance_history.json`、`credit-history.json`、`task-*.json`、`model.json`、`output_probes.json`、`request-logs/*.jsonl` |
 
-启动时对每个远端文件：本地缺失或**比远端旧**才拉回（本地较新则保留并由后台推上去）；运行期每 `r2.sync_interval_seconds` 秒把大小/mtime 变化的文件 PUT 上去，本地被保留策略删掉的归档分片同步 DELETE。
+启动时逐文件比较：本地缺失或**比远端旧**才拉回；本地较新则保留、并由后台推上去。运行期每 `r2.sync_interval_seconds` 秒把大小/mtime 变化的文件 PUT 上去；本地被保留策略删掉的归档分片同步 DELETE（远端不会无限增长）。
 
-**Worker 一侧**：R2 桶绑定到 `FILE_BUCKET`，Worker 密钥写进 `AUTH_KEY_SECRET`（即项目里的 `r2.auth_key`）。Worker 脚本即用户提供的文件管理器（`GET /` 列表、`GET/PUT/DELETE /<key>`）。
+**面板手动触发**：配置页底部有「**立即同步到 R2**」按钮（启用 R2 外置后自动出现；未启用时隐藏）。改完配置、加完账号想立刻把数据推上 R2、不等下一个后台间隔时点它——同步结果打进「运行日志」（每轮一条「上传 N、删除 M」），成败有 toast 提示。
 
-> **安全提醒（务必处理）**：原版脚本的 `authorizeRequest` 对 `GET` 恒放行——**任何人知道 Worker 地址就能下载桶里的全部文件**，包括 `auths/` 里的账号 refresh token。启用前请把 GET 也纳入鉴权：
+**Worker 一侧**：R2 桶绑定到 `FILE_BUCKET`，Worker 密钥写进 `AUTH_KEY_SECRET`（即项目里的 `r2.auth_key`）。Worker 脚本即通用文件管理器（`GET /` 列表、`GET/PUT/DELETE /<key>`）。
+
+> **安全提醒（务必处理）**：原版脚本的 `authorizeRequest` 对 `GET` 恒放行——**任何人知道 Worker 地址就能下载桶里的全部文件**，包括 `auth/` 下的账号 refresh token。启用前请把 GET 也纳入鉴权：
 >
 > ```js
 > function authorizeRequest(request, env, key) {
@@ -561,15 +565,48 @@ WB2A_R2_AUTH_KEY=<AUTH_KEY_SECRET>
 WB2A_R2_PREFIX=wb2a/
 ```
 
-三个变量在运行时同样生效（等价于写进配置文件），因此空盘部署可以只靠环境变量完成全部参数注入；首次启动前可先用同一套 Worker 把一份 `config.json` 传到 `wb2a/config/config.json`（文件管理器界面上传即可）。
+首次启动前，用同一套 Worker 的文件管理器页面把一份 `config.json` 手动传到 `wb2a/config/config.json` 即可完成初始引导。
 
 **注意事项**：
 
-- **同一份数据只允许一个实例写入**。两个实例同时跑会互相覆盖状态文件；多副本请各用独立的 `r2.prefix`。
+- **同一 prefix 只允许一个实例写入**。两个实例同时跑会互相覆盖状态文件；多副本请各用独立的 `r2.prefix`（数据也是独立的，不是共享池）。
 - 换 `auth_dir` / `state_file` 路径会让旧路径下的远端文件被视为「本地已删除」而被清理（`r2.sync_deletes=true` 时）。迁移路径前先备份或临时关闭删除同步。
-- 本地/远端谁更新的判断用文件 mtime 与 R2 对象 `uploaded` 时间戳，跨机器时钟偏差过大时可能判反；请保证系统时间准确（NTP）。
-- R2 侧没有请求归档的保留策略，删除依赖本程序的轮换；`r2.sync_deletes=false` 时远端会持续增长。
+- 新旧判断用文件 mtime 与 R2 对象 `uploaded` 时间戳，跨机器时钟偏差过大时可能判反；保证系统时间准确（NTP）。
+- Workers 免费版有 10 万次请求/天配额：间隔 60s + 文件数多时可能超，建议 300（5 分钟）。
 - `upstream.dump_dir` 等诊断目录不在同步范围（正文含用户提示词，不建议外置）。
+
+### 在 Render.com 上部署（免费实例 + R2 外置数据）
+
+Render 免费版没有持久磁盘、15 分钟无流量休眠——正是 R2 外置的用武之地：休眠唤醒/重新部署后，启动时自动从 R2 恢复 config/auths/data，**账号与状态不丢**。
+
+**步骤**：
+
+1. **Worker 先就绪**：按上一节把 Cloudflare Worker + R2 桶 + GET 鉴权改好。
+2. **推代码**：本仓库推到 GitHub（Render 从 Git 构建）。
+3. **Render 创建服务**：[render.com](https://render.com) → New → **Web Service** → 连接 GitHub 仓库 →
+   - Runtime: **Docker**（自动识别 Dockerfile）
+   - Instance Type: **Free**
+   - Health Check Path: `/healthz`
+4. **环境变量**（Render 服务的 Environment 页，缺一不可）：
+
+| 变量 | 值 | 作用 |
+|---|---|---|
+| `WB2A_API_KEY` | 自定长随机串，如 `sk-...` | **面板登录密码**（同时是网关 API 的 Bearer 密钥，即 config.json 的 api_key；环境变量优先于配置文件，重新部署后固定生效，不用去日志里找随机生成的那个） |
+| `WB2A_R2_BASE_URL` | `https://<worker>.workers.dev` | Worker 地址，非空即启用数据外置 |
+| `WB2A_R2_AUTH_KEY` | Worker 的 `AUTH_KEY_SECRET` | R2 写入/删除鉴权 |
+| `WB2A_R2_PREFIX` | `wb2a/` | 桶内前缀 |
+| `WB2A_R2_SYNC_INTERVAL_SECONDS` | `300` | 同步间隔（Workers 免费配额考虑，建议 300） |
+
+5. **首次初始化账号**（二选一）：
+   - 打开 `https://<服务名>.onrender.com/panel/`，用 `WB2A_API_KEY` 登录 → 「添加账号」完成 OAuth → 点配置页「**立即同步到 R2**」把凭证推上去（以后重启自动恢复）。
+   - 或者在本地已有跑着的 `auths/`：用 Worker 文件管理器把 `workbuddy-*.json` 传到 `wb2a/auth/` 下、`config.json` 传到 `wb2a/config/config.json`，Render 实例启动即全部拉回。
+6. **验证**：Logs 里看到 `[r2] 数据外置已启用` 与 `启动恢复：拉回 N`；做一次 Manual Deploy（Clear build cache），账号还在即链路通了。
+
+**Render 免费版注意事项**：
+
+- 15 分钟无流量休眠；要 7×24 保活可用 [cron-job.org](https://cron-job.org) 等每 10 分钟 GET `/healthz`（无副作用）。
+- 免费实例出站 IP 不固定（重启会变）；上游风控目前主要看账号凭证维度，IP 浮动影响有限。
+- 升级版本：直接 push 到 main，Render 自动重建部署，数据从 R2 回来。
 
 ## 核心行为语义
 
